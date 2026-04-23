@@ -1,0 +1,150 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Activepieces prod — EC2 capacity for the ConnectorsAppCluster. Creates a
+  launch template pinned to the latest ECS-optimized AL2 AMI, an Auto Scaling
+  Group across the private subnets, and (optionally) an ECS capacity provider
+  with managed scaling. Instances self-register with ConnectorsAppCluster via
+  user-data.
+
+  Defaults: 2 t3.medium instances, min=2/max=6. Sized for a starter prod
+  footprint of 1 APP task + 2 WORKER tasks with slack for rolling deploys.
+
+Parameters:
+  ClusterName:
+    Type: String
+    Default: ConnectorsAppCluster
+    Description: Existing ECS cluster. Instances register into it via user-data.
+
+  PrivateSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Private subnets for the ASG.
+
+  InstanceType:
+    Type: String
+    Default: t3.medium
+    AllowedValues:
+      - t3.medium
+      - t3.large
+      - m5.large
+      - m5.xlarge
+    Description: EC2 instance class. t3.medium fits the default task sizes.
+
+  MinSize:
+    Type: Number
+    Default: 2
+  MaxSize:
+    Type: Number
+    Default: 6
+  DesiredCapacity:
+    Type: Number
+    Default: 2
+
+  LatestEcsAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ecs/optimized-ami/amazon-linux-2/recommended/image_id
+    Description: SSM parameter alias — always resolves to the current ECS-optimized AL2 AMI.
+
+  CreateCapacityProvider:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: >
+      If true, also create an ECS capacity provider with managed scaling.
+      Attaching it to the cluster's default strategy is a separate manual
+      step (see cloudformation/README.md §post-4) because the cluster is
+      shared with other services.
+
+Conditions:
+  ShouldCreateCapacityProvider: !Equals [!Ref CreateCapacityProvider, 'true']
+
+Resources:
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: activepieces-prod-lt
+      LaunchTemplateData:
+        ImageId: !Ref LatestEcsAmiId
+        InstanceType: !Ref InstanceType
+        IamInstanceProfile:
+          Arn: !ImportValue activepieces-prod-ecs-instance-profile-arn
+        SecurityGroupIds:
+          - !ImportValue activepieces-prod-tasks-sg
+        MetadataOptions:
+          HttpTokens: required
+          HttpPutResponseHopLimit: 2
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs:
+              VolumeSize: 30
+              VolumeType: gp3
+              Encrypted: true
+              DeleteOnTermination: true
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            echo "ECS_CLUSTER=${ClusterName}" >> /etc/ecs/ecs.config
+            echo "ECS_ENABLE_CONTAINER_METADATA=true" >> /etc/ecs/ecs.config
+            echo "ECS_IMAGE_PULL_BEHAVIOR=prefer-cached" >> /etc/ecs/ecs.config
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: activepieces-prod-ecs
+              - Key: Project
+                Value: activepieces-prod
+
+  AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        MinInstancesInService: !Ref MinSize
+        MaxBatchSize: 1
+        PauseTime: PT5M
+        SuspendProcesses: [HealthCheck, ReplaceUnhealthy, AZRebalance, AlarmNotification, ScheduledActions]
+        WaitOnResourceSignals: false
+    Properties:
+      AutoScalingGroupName: activepieces-prod-asg
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+      MinSize: !Ref MinSize
+      MaxSize: !Ref MaxSize
+      DesiredCapacity: !Ref DesiredCapacity
+      VPCZoneIdentifier: !Ref PrivateSubnetIds
+      HealthCheckType: EC2
+      HealthCheckGracePeriod: 300
+      # Required so a capacity provider (if used) can manage termination protection.
+      NewInstancesProtectedFromScaleIn: !If [ShouldCreateCapacityProvider, true, false]
+      Tags:
+        - Key: Name
+          Value: activepieces-prod-ecs
+          PropagateAtLaunch: true
+        - Key: AmazonECSManaged
+          Value: 'true'
+          PropagateAtLaunch: true
+
+  CapacityProvider:
+    Type: AWS::ECS::CapacityProvider
+    Condition: ShouldCreateCapacityProvider
+    Properties:
+      Name: activepieces-prod-cp
+      AutoScalingGroupProvider:
+        AutoScalingGroupArn: !Ref AutoScalingGroup
+        ManagedScaling:
+          Status: ENABLED
+          TargetCapacity: 75
+          MinimumScalingStepSize: 1
+          MaximumScalingStepSize: 2
+        ManagedTerminationProtection: ENABLED
+
+Outputs:
+  AutoScalingGroupName:
+    Value: !Ref AutoScalingGroup
+    Export: { Name: activepieces-prod-asg-name }
+  LaunchTemplateId:
+    Value: !Ref LaunchTemplate
+    Export: { Name: activepieces-prod-lt-id }
+  CapacityProviderName:
+    Condition: ShouldCreateCapacityProvider
+    Value: !Ref CapacityProvider
+    Export: { Name: activepieces-prod-capacity-provider-name }

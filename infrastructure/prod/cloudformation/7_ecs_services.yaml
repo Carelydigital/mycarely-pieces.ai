@@ -1,0 +1,130 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Activepieces prod — two ECS services in the existing ConnectorsAppCluster:
+  APP (behind the ALB) and WORKER. Service names follow the convention
+  `ConnectorsECSServices3-ActivePieces-<RAND>` /
+  `ConnectorsECSServices3-ActivePiecesWorker-<RAND>`; the random suffix is
+  the first segment of the stack UUID (8 hex chars), so it is stable across
+  stack updates but differs between fresh stack creations. Pass an explicit
+  `AppServiceNameSuffix` / `WorkerServiceNameSuffix` parameter to pin it.
+
+  The services reference task definitions by family name, so CI
+  (aws-actions/amazon-ecs-deploy-task-definition) can register new revisions
+  and update the running service without causing CFN drift on structural
+  properties.
+
+Parameters:
+  ClusterName:
+    Type: String
+    Default: ConnectorsAppCluster
+    Description: Existing ECS cluster.
+
+  AppDesiredCount:
+    Type: Number
+    Default: 1
+    MinValue: 1
+    Description: APP task count. Scale to 2+ for HA.
+
+  WorkerDesiredCount:
+    Type: Number
+    Default: 2
+    MinValue: 1
+    Description: WORKER task count. Scale with queue depth.
+
+  AppServiceNameSuffix:
+    Type: String
+    Default: ''
+    Description: >
+      Optional suffix for the APP service name. Leave blank to let the
+      template derive one from the stack id. Provide a fixed value if you
+      want the service name stable across stack replacements.
+
+  WorkerServiceNameSuffix:
+    Type: String
+    Default: ''
+    Description: Same as AppServiceNameSuffix for the WORKER service.
+
+Conditions:
+  AppSuffixProvided: !Not [!Equals [!Ref AppServiceNameSuffix, '']]
+  WorkerSuffixProvided: !Not [!Equals [!Ref WorkerServiceNameSuffix, '']]
+
+Resources:
+  AppService:
+    Type: AWS::ECS::Service
+    # DependsOn is only needed at first create so the target group has a
+    # listener; since listener creation is manual (§bootstrap §12), the
+    # operator must create the HTTPS:443 listener BEFORE this resource
+    # converges — otherwise ECS registers targets but health checks can't
+    # report back to any rule.
+    Properties:
+      ServiceName: !If
+        - AppSuffixProvided
+        - !Sub ConnectorsECSServices3-ActivePieces-${AppServiceNameSuffix}
+        - !Sub
+          - ConnectorsECSServices3-ActivePieces-${Suffix}
+          - Suffix: !Select [0, !Split ['-', !Select [2, !Split ['/', !Ref AWS::StackId]]]]
+      Cluster: !Ref ClusterName
+      TaskDefinition: !ImportValue activepieces-prod-app-taskdef-family
+      DesiredCount: !Ref AppDesiredCount
+      LaunchType: EC2
+      SchedulingStrategy: REPLICA
+      HealthCheckGracePeriodSeconds: 180
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 100
+        MaximumPercent: 200
+        DeploymentCircuitBreaker:
+          Enable: true
+          Rollback: true
+      DeploymentController: { Type: ECS }
+      LoadBalancers:
+        - ContainerName: app
+          ContainerPort: 80
+          TargetGroupArn: !ImportValue activepieces-prod-app-tg-arn
+      PlacementStrategies:
+        - Type: spread
+          Field: attribute:ecs.availability-zone
+        - Type: spread
+          Field: instanceId
+      Tags:
+        - { Key: Project, Value: activepieces-prod }
+        - { Key: Tier,    Value: app }
+      PropagateTags: SERVICE
+
+  WorkerService:
+    Type: AWS::ECS::Service
+    Properties:
+      ServiceName: !If
+        - WorkerSuffixProvided
+        - !Sub ConnectorsECSServices3-ActivePiecesWorker-${WorkerServiceNameSuffix}
+        - !Sub
+          - ConnectorsECSServices3-ActivePiecesWorker-${Suffix}
+          - Suffix: !Select [0, !Split ['-', !Select [2, !Split ['/', !Ref AWS::StackId]]]]
+      Cluster: !Ref ClusterName
+      TaskDefinition: !ImportValue activepieces-prod-worker-taskdef-family
+      DesiredCount: !Ref WorkerDesiredCount
+      LaunchType: EC2
+      SchedulingStrategy: REPLICA
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 50
+        MaximumPercent: 200
+        DeploymentCircuitBreaker:
+          Enable: true
+          Rollback: true
+      DeploymentController: { Type: ECS }
+      PlacementStrategies:
+        - Type: spread
+          Field: attribute:ecs.availability-zone
+        - Type: spread
+          Field: instanceId
+      Tags:
+        - { Key: Project, Value: activepieces-prod }
+        - { Key: Tier,    Value: worker }
+      PropagateTags: SERVICE
+
+Outputs:
+  AppServiceName:
+    Value: !Ref AppService
+    Export: { Name: activepieces-prod-app-service-name }
+  WorkerServiceName:
+    Value: !Ref WorkerService
+    Export: { Name: activepieces-prod-worker-service-name }

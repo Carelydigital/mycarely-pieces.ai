@@ -1,0 +1,195 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Activepieces prod — ECS task definitions for APP and WORKER. Both container
+  definitions use the same image; `AP_CONTAINER_TYPE` flips behaviour.
+
+  The ImageTag parameter defaults to `main-latest`, which CI (GitHub Actions
+  on PR-merge to main) keeps current. After the initial deploy, CI updates
+  the service's running task definition directly via
+  `aws-actions/amazon-ecs-deploy-task-definition`, registering a new revision
+  outside CloudFormation. Re-running this stack later rebases the service
+  back to the ImageTag specified here — expect brief drift around CFN
+  re-runs, then CI pushes forward on the next merge.
+
+Parameters:
+  EcrRepoUri:
+    Type: String
+    Default: 557690597652.dkr.ecr.eu-central-1.amazonaws.com/connectors/activepieces
+    Description: ECR image URI without tag.
+
+  ImageTag:
+    Type: String
+    Default: main-latest
+    Description: >
+      Tag used for the initial task def. CI pushes `main-<sha>` tags; see
+      the deploy-prod.yml workflow.
+
+  ProdDomain:
+    Type: String
+    Description: Public FQDN (e.g. pieces.mycarely.io). Used for AP_FRONTEND_URL.
+
+  ExecutionMode:
+    Type: String
+    Default: SANDBOX_CODE_AND_PROCESS
+    AllowedValues:
+      - SANDBOX_CODE_AND_PROCESS
+      - SANDBOX_CODE_ONLY
+      - SANDBOX_PROCESS
+      - UNSANDBOXED
+    Description: >
+      Prod default: SANDBOX_CODE_AND_PROCESS. Requires EC2 launch type
+      (Fargate restricts the needed Linux capabilities).
+
+  AppCpu:
+    Type: Number
+    Default: 1024
+  AppMemory:
+    Type: Number
+    Default: 2048
+  WorkerCpu:
+    Type: Number
+    Default: 1024
+  WorkerMemory:
+    Type: Number
+    Default: 2048
+  WorkerConcurrency:
+    Type: Number
+    Default: 10
+    Description: AP_WORKER_CONCURRENCY — concurrent flow runs per worker task.
+
+Resources:
+  AppTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: activepieces-prod-app
+      NetworkMode: bridge
+      RequiresCompatibilities: [EC2]
+      Cpu: !Ref AppCpu
+      Memory: !Ref AppMemory
+      ExecutionRoleArn: !ImportValue activepieces-prod-task-execution-role-arn
+      TaskRoleArn: !ImportValue activepieces-prod-app-task-role-arn
+      ContainerDefinitions:
+        - Name: app
+          Image: !Sub ${EcrRepoUri}:${ImageTag}
+          Essential: true
+          StopTimeout: 60
+          PortMappings:
+            - ContainerPort: 80
+              HostPort: 0
+              Protocol: tcp
+          Ulimits:
+            - Name: nofile
+              SoftLimit: 65535
+              HardLimit: 65535
+          Environment:
+            - Name: AP_CONTAINER_TYPE
+              Value: APP
+            - Name: AP_ENVIRONMENT
+              Value: prod
+            - Name: AP_FRONTEND_URL
+              Value: !Sub https://${ProdDomain}
+            - Name: AP_EXECUTION_MODE
+              Value: !Ref ExecutionMode
+            - Name: AP_ENGINE_EXECUTABLE_PATH
+              Value: dist/packages/engine/main.js
+            - Name: AP_TELEMETRY_ENABLED
+              Value: 'false'
+            - Name: AP_QUEUE_UI_ENABLED
+              Value: 'false'
+            - Name: AP_DB_TYPE
+              Value: POSTGRES
+            - Name: AP_POSTGRES_HOST
+              Value: !ImportValue activepieces-prod-db-host
+            - Name: AP_POSTGRES_PORT
+              Value: !ImportValue activepieces-prod-db-port
+            - Name: AP_POSTGRES_DATABASE
+              Value: activepieces
+            - Name: AP_POSTGRES_USERNAME
+              Value: activepieces
+            - Name: AP_POSTGRES_USE_SSL
+              Value: 'true'
+            - Name: AP_REDIS_TYPE
+              Value: STANDALONE
+            - Name: AP_REDIS_HOST
+              Value: !ImportValue activepieces-prod-redis-host
+            - Name: AP_REDIS_PORT
+              Value: !ImportValue activepieces-prod-redis-port
+            - Name: AP_FILE_STORAGE_LOCATION
+              Value: S3
+            - Name: AP_S3_BUCKET
+              Value: !ImportValue activepieces-prod-files-bucket
+            - Name: AP_S3_REGION
+              Value: !Ref AWS::Region
+            - Name: AP_S3_USE_IRSA
+              Value: 'false'
+            - Name: AP_S3_USE_SIGNED_URLS
+              Value: 'true'
+          Secrets:
+            - Name: AP_JWT_SECRET
+              ValueFrom: !ImportValue activepieces-prod-jwt-secret-arn
+            - Name: AP_ENCRYPTION_KEY
+              ValueFrom: !ImportValue activepieces-prod-encryption-key-secret-arn
+            - Name: AP_POSTGRES_PASSWORD
+              ValueFrom: !ImportValue activepieces-prod-postgres-password-secret-arn
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !ImportValue activepieces-prod-app-log-group
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: app
+
+  WorkerTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: activepieces-prod-worker
+      NetworkMode: bridge
+      RequiresCompatibilities: [EC2]
+      Cpu: !Ref WorkerCpu
+      Memory: !Ref WorkerMemory
+      ExecutionRoleArn: !ImportValue activepieces-prod-task-execution-role-arn
+      TaskRoleArn: !ImportValue activepieces-prod-worker-task-role-arn
+      Volumes:
+        - Name: cache
+          Host: {}
+      ContainerDefinitions:
+        - Name: worker
+          Image: !Sub ${EcrRepoUri}:${ImageTag}
+          Essential: true
+          StopTimeout: 60
+          MountPoints:
+            - SourceVolume: cache
+              ContainerPath: /usr/src/app/cache
+          Environment:
+            - Name: AP_CONTAINER_TYPE
+              Value: WORKER
+            - Name: AP_FRONTEND_URL
+              Value: !Sub https://${ProdDomain}
+            - Name: AP_EXECUTION_MODE
+              Value: !Ref ExecutionMode
+            - Name: AP_ENGINE_EXECUTABLE_PATH
+              Value: dist/packages/engine/main.js
+            - Name: AP_WORKER_CONCURRENCY
+              Value: !Sub '${WorkerConcurrency}'
+          Secrets:
+            - Name: AP_WORKER_TOKEN
+              ValueFrom: !ImportValue activepieces-prod-worker-token-secret-arn
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !ImportValue activepieces-prod-worker-log-group
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: worker
+
+Outputs:
+  AppTaskDefinitionArn:
+    Value: !Ref AppTaskDefinition
+    Export: { Name: activepieces-prod-app-taskdef-arn }
+  WorkerTaskDefinitionArn:
+    Value: !Ref WorkerTaskDefinition
+    Export: { Name: activepieces-prod-worker-taskdef-arn }
+  AppTaskDefinitionFamily:
+    Value: activepieces-prod-app
+    Export: { Name: activepieces-prod-app-taskdef-family }
+  WorkerTaskDefinitionFamily:
+    Value: activepieces-prod-worker
+    Export: { Name: activepieces-prod-worker-taskdef-family }
