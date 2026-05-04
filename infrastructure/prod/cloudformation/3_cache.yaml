@@ -1,0 +1,55 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Activepieces prod — ElastiCache Redis. Single-node cache.t4g.small, no auth,
+  no TLS; traffic is confined to the VPC via the tasks-only ingress rule on
+  stack 1's Redis security group. Add a replica + failover when queue depth
+  or availability requires it.
+
+Parameters:
+  PrivateSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Private subnets (≥2) for the cache subnet group.
+
+  NodeType:
+    Type: String
+    Default: cache.t4g.small
+    AllowedValues:
+      - cache.t4g.micro
+      - cache.t4g.small
+      - cache.t4g.medium
+      - cache.m7g.large
+    Description: Instance class. t4g.small is a defensible starting point.
+
+Resources:
+  CacheSubnetGroup:
+    Type: AWS::ElastiCache::SubnetGroup
+    Properties:
+      CacheSubnetGroupName: activepieces-prod
+      Description: Activepieces prod
+      SubnetIds: !Ref PrivateSubnetIds
+
+  RedisCluster:
+    Type: AWS::ElastiCache::CacheCluster
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      ClusterName: activepieces-prod-redis
+      Engine: redis
+      EngineVersion: '7.0'
+      CacheNodeType: !Ref NodeType
+      NumCacheNodes: 1
+      CacheSubnetGroupName: !Ref CacheSubnetGroup
+      VpcSecurityGroupIds:
+        - !ImportValue activepieces-prod-redis-sg
+      AutoMinorVersionUpgrade: true
+      Tags:
+        - Key: Name
+          Value: activepieces-prod-redis
+
+Outputs:
+  RedisHost:
+    Value: !GetAtt RedisCluster.RedisEndpoint.Address
+    Export: { Name: activepieces-prod-redis-host }
+  RedisPort:
+    Value: !GetAtt RedisCluster.RedisEndpoint.Port
+    Export: { Name: activepieces-prod-redis-port }

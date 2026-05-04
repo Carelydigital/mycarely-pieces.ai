@@ -1,0 +1,307 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Activepieces prod — foundation. Creates the four security groups, IAM roles
+  (task execution, APP task, WORKER task, EC2 instance), four Secrets Manager
+  entries, the S3 files bucket, and two CloudWatch log groups. Exports every
+  ID/ARN the downstream templates (2–7) consume.
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC hosting the existing ConnectorsAppCluster.
+
+  S3BucketName:
+    Type: String
+    Default: connectors-activepieces-prod-files
+    Description: Must be globally unique across AWS. Change only if already taken.
+
+Resources:
+  # ---- Security groups ----------------------------------------------------
+
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: activepieces-prod-alb
+      GroupDescription: Activepieces prod ALB
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS from internet (tighten to Cloudflare IPs later)
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: HTTP (redirects to 443 at listener level)
+      Tags:
+        - Key: Name
+          Value: activepieces-prod-alb
+
+  TasksSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: activepieces-prod-tasks
+      GroupDescription: Activepieces prod ECS tasks (APP + WORKER)
+      VpcId: !Ref VpcId
+      Tags:
+        - Key: Name
+          Value: activepieces-prod-tasks
+
+  # ECS bridge networking uses dynamic host ports in the ephemeral range.
+  TasksIngressFromAlb:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref TasksSecurityGroup
+      SourceSecurityGroupId: !Ref AlbSecurityGroup
+      IpProtocol: tcp
+      FromPort: 32768
+      ToPort: 65535
+      Description: Dynamic host port range from ALB
+
+  RdsSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: activepieces-prod-rds
+      GroupDescription: Activepieces prod RDS
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref TasksSecurityGroup
+          Description: Postgres from ECS tasks only (workers do not touch the DB directly)
+      Tags:
+        - Key: Name
+          Value: activepieces-prod-rds
+
+  RedisSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: activepieces-prod-redis
+      GroupDescription: Activepieces prod ElastiCache
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 6379
+          ToPort: 6379
+          SourceSecurityGroupId: !Ref TasksSecurityGroup
+          Description: Redis from ECS tasks only
+      Tags:
+        - Key: Name
+          Value: activepieces-prod-redis
+
+  # ---- IAM roles ----------------------------------------------------------
+
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: activepieces-prod-task-execution
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: read-activepieces-prod-secrets
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Sub arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:/activepieces/prod/*
+
+  AppTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: activepieces-prod-app-task
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: s3-files
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub arn:aws:s3:::${S3BucketName}
+                  - !Sub arn:aws:s3:::${S3BucketName}/*
+
+  WorkerTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: activepieces-prod-worker-task
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+
+  EcsInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: activepieces-prod-ecs-instance
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceforEC2Role
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+
+  EcsInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: activepieces-prod-ecs-instance
+      Roles: [ !Ref EcsInstanceRole ]
+
+  # ---- Secrets ------------------------------------------------------------
+  # GenerateSecretString seeds an initial random value. CFN does NOT overwrite
+  # the value on subsequent stack updates, so operators can safely run
+  # `aws secretsmanager put-secret-value` to set hex-encoded values where
+  # required (encryption key, worker token). See README.md §post-1.
+
+  JwtSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: /activepieces/prod/jwt-secret
+      Description: AP_JWT_SECRET — signs auth JWTs and worker tokens
+      GenerateSecretString:
+        PasswordLength: 64
+        ExcludePunctuation: true
+
+  EncryptionKeySecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: /activepieces/prod/encryption-key
+      Description: AP_ENCRYPTION_KEY — must be 32 hex chars; overwrite manually after stack create
+      GenerateSecretString:
+        PasswordLength: 32
+        ExcludePunctuation: true
+        ExcludeUppercase: true
+
+  PostgresPasswordSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: /activepieces/prod/postgres-password
+      Description: AP_POSTGRES_PASSWORD — RDS master password
+      GenerateSecretString:
+        PasswordLength: 32
+        ExcludePunctuation: true
+
+  WorkerTokenSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: /activepieces/prod/worker-token
+      Description: AP_WORKER_TOKEN — populate after first APP deploy via `npm run workers token`
+      GenerateSecretString:
+        PasswordLength: 32
+        ExcludePunctuation: true
+
+  # ---- S3 bucket ----------------------------------------------------------
+
+  FilesBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Ref S3BucketName
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        IgnorePublicAcls: true
+        BlockPublicPolicy: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration: { Status: Enabled }
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireFlowRunLogs
+            Status: Enabled
+            Prefix: flow-runs/
+            ExpirationInDays: 90
+
+  # ---- Log groups ---------------------------------------------------------
+
+  AppLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      LogGroupName: /ecs/activepieces-prod-app
+      RetentionInDays: 30
+
+  WorkerLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      LogGroupName: /ecs/activepieces-prod-worker
+      RetentionInDays: 30
+
+Outputs:
+  AlbSecurityGroupId:
+    Value: !Ref AlbSecurityGroup
+    Export: { Name: activepieces-prod-alb-sg }
+  TasksSecurityGroupId:
+    Value: !Ref TasksSecurityGroup
+    Export: { Name: activepieces-prod-tasks-sg }
+  RdsSecurityGroupId:
+    Value: !Ref RdsSecurityGroup
+    Export: { Name: activepieces-prod-rds-sg }
+  RedisSecurityGroupId:
+    Value: !Ref RedisSecurityGroup
+    Export: { Name: activepieces-prod-redis-sg }
+  TaskExecutionRoleArn:
+    Value: !GetAtt TaskExecutionRole.Arn
+    Export: { Name: activepieces-prod-task-execution-role-arn }
+  AppTaskRoleArn:
+    Value: !GetAtt AppTaskRole.Arn
+    Export: { Name: activepieces-prod-app-task-role-arn }
+  WorkerTaskRoleArn:
+    Value: !GetAtt WorkerTaskRole.Arn
+    Export: { Name: activepieces-prod-worker-task-role-arn }
+  EcsInstanceProfileName:
+    Value: !Ref EcsInstanceProfile
+    Export: { Name: activepieces-prod-ecs-instance-profile }
+  EcsInstanceProfileArn:
+    Value: !GetAtt EcsInstanceProfile.Arn
+    Export: { Name: activepieces-prod-ecs-instance-profile-arn }
+  JwtSecretArn:
+    Value: !Ref JwtSecret
+    Export: { Name: activepieces-prod-jwt-secret-arn }
+  EncryptionKeySecretArn:
+    Value: !Ref EncryptionKeySecret
+    Export: { Name: activepieces-prod-encryption-key-secret-arn }
+  PostgresPasswordSecretArn:
+    Value: !Ref PostgresPasswordSecret
+    Export: { Name: activepieces-prod-postgres-password-secret-arn }
+  WorkerTokenSecretArn:
+    Value: !Ref WorkerTokenSecret
+    Export: { Name: activepieces-prod-worker-token-secret-arn }
+  FilesBucketName:
+    Value: !Ref FilesBucket
+    Export: { Name: activepieces-prod-files-bucket }
+  AppLogGroupName:
+    Value: !Ref AppLogGroup
+    Export: { Name: activepieces-prod-app-log-group }
+  WorkerLogGroupName:
+    Value: !Ref WorkerLogGroup
+    Export: { Name: activepieces-prod-worker-log-group }

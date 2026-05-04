@@ -1,0 +1,86 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Activepieces prod — internet-facing ALB and the APP target group. Does NOT
+  create listeners — per operator preference, HTTPS:443 + ACM certificate +
+  any HTTP→HTTPS redirect are configured manually against this ALB so the
+  certificate ARN stays out of this template. Same reason the public domain
+  is not referenced here.
+
+  Output `TargetGroupArn` is consumed by stack 7 (ECS services) so the APP
+  service registers into it on creation. Output `LoadBalancerDnsName` is
+  pasted into Cloudflare as the CNAME target for the prod domain.
+
+Parameters:
+  PublicSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Public subnets (≥2 AZs) where the ALB lives.
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC hosting the cluster — needed for the target group.
+
+  HealthCheckPath:
+    Type: String
+    Default: /api/v1/flags
+    Description: Unauthenticated endpoint that responds 200 when the app is healthy.
+
+  IdleTimeoutSeconds:
+    Type: Number
+    Default: 120
+    Description: >
+      ALB idle timeout. Long-running webhook handlers and flow previews can
+      exceed the 60-second default, causing 504s.
+
+Resources:
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: activepieces-prod-alb
+      Scheme: internet-facing
+      Type: application
+      IpAddressType: ipv4
+      Subnets: !Ref PublicSubnetIds
+      SecurityGroups:
+        - !ImportValue activepieces-prod-alb-sg
+      LoadBalancerAttributes:
+        - Key: idle_timeout.timeout_seconds
+          Value: !Ref IdleTimeoutSeconds
+        - Key: routing.http.drop_invalid_header_fields.enabled
+          Value: 'true'
+        - Key: deletion_protection.enabled
+          Value: 'true'
+
+  AppTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: activepieces-prod-app-tg
+      TargetType: instance
+      Protocol: HTTP
+      Port: 80
+      VpcId: !Ref VpcId
+      HealthCheckProtocol: HTTP
+      HealthCheckPath: !Ref HealthCheckPath
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 10
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher: { HttpCode: '200-299' }
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: '30'
+        - Key: stickiness.enabled
+          Value: 'false'
+
+Outputs:
+  LoadBalancerArn:
+    Value: !Ref LoadBalancer
+    Export: { Name: activepieces-prod-alb-arn }
+  LoadBalancerDnsName:
+    Value: !GetAtt LoadBalancer.DNSName
+    Export: { Name: activepieces-prod-alb-dns }
+  LoadBalancerCanonicalHostedZoneId:
+    Value: !GetAtt LoadBalancer.CanonicalHostedZoneID
+    Export: { Name: activepieces-prod-alb-canonical-zone-id }
+  TargetGroupArn:
+    Value: !Ref AppTargetGroup
+    Export: { Name: activepieces-prod-app-tg-arn }

@@ -1,0 +1,102 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Activepieces prod — RDS Postgres. Creates the subnet group, parameter group,
+  and the encrypted db.t4g.small DB instance. Imports the RDS security group
+  and the Postgres master-password secret ARN from stack 1 (foundation).
+  Single-AZ by default; flip MultiAZ to `true` when SLA demands sync failover.
+
+Parameters:
+  PrivateSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Private subnets (≥2, in different AZs) for the DB subnet group.
+
+  DbInstanceClass:
+    Type: String
+    Default: db.t4g.small
+    AllowedValues:
+      - db.t4g.small
+      - db.t4g.medium
+      - db.m6g.large
+      - db.m6g.xlarge
+    Description: Vertical size. Start small; scale when queries become the bottleneck.
+
+  AllocatedStorageGb:
+    Type: Number
+    Default: 20
+    MinValue: 20
+    Description: GP3 storage in GB. Grows online via modify-db-instance.
+
+  MultiAZ:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: Enable synchronous standby in another AZ. Roughly 2× cost.
+
+  BackupRetentionDays:
+    Type: Number
+    Default: 7
+    MinValue: 1
+    MaxValue: 35
+
+Conditions:
+  IsMultiAZ: !Equals [!Ref MultiAZ, 'true']
+
+Resources:
+  DbSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupName: activepieces-prod
+      DBSubnetGroupDescription: Activepieces prod
+      SubnetIds: !Ref PrivateSubnetIds
+
+  DbParameterGroup:
+    Type: AWS::RDS::DBParameterGroup
+    Properties:
+      DBParameterGroupName: activepieces-prod-pg14
+      Family: postgres14
+      Description: Activepieces prod Postgres 14
+
+  DbInstance:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Snapshot
+    UpdateReplacePolicy: Snapshot
+    Properties:
+      DBInstanceIdentifier: activepieces-prod-db
+      Engine: postgres
+      EngineVersion: '14.12'
+      DBInstanceClass: !Ref DbInstanceClass
+      AllocatedStorage: !Ref AllocatedStorageGb
+      StorageType: gp3
+      StorageEncrypted: true
+      DBName: activepieces
+      MasterUsername: activepieces
+      # Dynamic reference: CFN resolves the secret value at stack-op time.
+      # Rotation of the secret does NOT propagate here automatically — use
+      # `aws rds modify-db-instance --master-user-password` in a runbook if
+      # you rotate the secret post-bootstrap.
+      MasterUserPassword:
+        !Sub
+          - '{{resolve:secretsmanager:${SecretArn}:SecretString}}'
+          - SecretArn: !ImportValue activepieces-prod-postgres-password-secret-arn
+      DBSubnetGroupName: !Ref DbSubnetGroup
+      DBParameterGroupName: !Ref DbParameterGroup
+      VPCSecurityGroups:
+        - !ImportValue activepieces-prod-rds-sg
+      PubliclyAccessible: false
+      MultiAZ: !If [IsMultiAZ, true, false]
+      BackupRetentionPeriod: !Ref BackupRetentionDays
+      DeletionProtection: true
+      EnablePerformanceInsights: true
+      PerformanceInsightsRetentionPeriod: 7
+      AutoMinorVersionUpgrade: true
+      Tags:
+        - Key: Name
+          Value: activepieces-prod-db
+
+Outputs:
+  DbHost:
+    Value: !GetAtt DbInstance.Endpoint.Address
+    Export: { Name: activepieces-prod-db-host }
+  DbPort:
+    Value: !GetAtt DbInstance.Endpoint.Port
+    Export: { Name: activepieces-prod-db-port }
